@@ -68,6 +68,9 @@ class Chunk(object):
     def format(self, *args):
         return Chunk(self.value.format(*[arg.value for arg in args]), Chunk.start(args[0]), Chunk.end(args[-1]))
 
+    def replace(self, x, y):
+        return Chunk(self.value.replace(x, y), self.start, self.end)
+
     def indent(self):
         return Chunk(indent(self.value), self.start, self.end)
 
@@ -133,6 +136,29 @@ class Rewriter(Transformer):
     UNARY_OPERATOR = literal
     PREFIX_UNARY_OPERATOR = literal
 
+    # TEMPLATE_CHARACTERS: /(\\{|[^{])+/
+    TEMPLATE_CHARACTERS = literal
+    # template_head: "`" TEMPLATE_CHARACTERS? "{"
+    def template_head(self, children):
+        return Chunk('`{}${{').format(children[0] if children else Chunk(''))
+    # template_middle: "}" TEMPLATE_CHARACTERS? "{"
+    def template_middle(self, children):
+        return Chunk('}}{}${{').format(children[0] if children else Chunk(''))
+    # template_tail: "}" TEMPLATE_CHARACTERS? "`"
+    def template_tail(self, children):
+        return Chunk('}}{}`').format(children[0] if children else Chunk(''))
+
+    # template_substituted: template_head expression ( template_middle expression )* template_tail
+    def template_substituted(self, children):
+        return Chunk('').join(children)
+
+    # template_pure: "`" TEMPLATE_CHARACTERS "`"
+    def template_pure(self, children):
+        return Chunk('`{}`').format(children[0] if children else Chunk(''))
+
+    # template_literal: template_pure | template_substituted
+    template_literal = passthru
+
     def IDENTIFIER(self, id):
         prefix = "Lib." if literal(self, id).value in ashref else ""
         return Chunk(prefix + camelcase(literal(self, id).value))
@@ -190,18 +216,18 @@ class Rewriter(Transformer):
     enum_name = passthru
 
     # singular_enum_expression: "$" ENUMERATED_TYPE "[" enum_name "]"
-    singular_enum_expression = formatted('${}[{}]')
+    singular_enum_expression = formatted('${}`{}`')
 
     # plural_enum_expression: "$" ENUMERATED_TYPES "[" ( enum_name ( "," enum_name )* )? "]"
     def plural_enum_expression(self, children):
         print(children)
         typ, *rest = children
-        return Chunk('${}[{}]').format(typ, Chunk(', ').join(rest))
+        return Chunk('${}`{}`').format(typ, Chunk(', ').join(rest))
 
     # enum_expression: singular_enum_expression | plural_enum_expression
     enum_expression = passthru
 
-    # expression: binary_expression | unary_expression | unary_postfix_expression | ternary_expression | enum_expression | method_expression | field_expression | index_expression | paren_expression | function_call | call_expression | new_expression | NUMBER | STRING_LITERAL | BOOLEAN | IDENTIFIER
+    # expression: binary_expression | unary_expression | unary_postfix_expression | ternary_expression | enum_expression | method_expression | field_expression | index_expression | paren_expression | function_call | call_expression | new_expression | NUMBER | STRING_LITERAL | template_literal | BOOLEAN | IDENTIFIER
     expression = passthru
 
     # index_type: PRIMITIVE_TYPE | ENUMERATED_TYPE | /[0-9]+/
@@ -262,7 +288,7 @@ class Rewriter(Transformer):
     def foreach_statement(self, children):
         names = children[:-2]
         aggregate, body = children[-2:]
-        return Chunk('foreach {} in {} {}').format(Chunk(', ').join(names), aggregate, body)
+        return Chunk('for (const {} of {}) {}').format(literal(self, names[0]), aggregate, body)
 
     # case: ( "case" expression | "default" ) ":" ( block_or_statement )*
     def case(self, children):
@@ -312,12 +338,12 @@ class Rewriter(Transformer):
     @v_args(meta=True)
     def record_declaration(self, children, meta):
         name, *rest = children
-        return Chunk('record {} {{\n{}\n}}').format(name, Chunk.join_lines(rest)).with_meta(meta)
+        return Chunk('') # Chunk('record {} {{\n{}\n}}').format(name, Chunk.join_lines(rest)).with_meta(meta)
 
     # import_statement: "import" ( STRING_LITERAL | /<.*?(?<!\\\\)>/ )
     def import_statement(self, children):
-        literal, = children
-        return Chunk('import <{}>').format(literal[1:-1])
+        text, = children
+        return Chunk('import "{}";').format(literal(self, text)[1:-1].replace(".ash", ".ts"))
 
     # statement: if_statement | while_statement | for_statement | foreach_statement | switch_statement | static_statement | return_statement | typedef_statement | remove_statement | sort_statement | CONTINUE_STATEMENT | BREAK_STATEMENT | since_statement | variable_declaration_statement | expression_statement 
     statement = passthru
@@ -349,6 +375,13 @@ l = Lark('''
          IDENTIFIER: /[a-zA-Z_][0-9a-zA-Z_]*/
          NUMBER: /[+-]?[0-9]+(\.[0-9]+)?/ | /[+-]?\.[0-9]+/
          STRING_LITERAL: /".*?(?<!\\\\)"/ | /'.*?(?<!\\\\)'/
+         TEMPLATE_CHARACTERS: /[^{`]+/
+         template_head: "`" TEMPLATE_CHARACTERS? "{"
+         template_middle: "}" TEMPLATE_CHARACTERS? "{"
+         template_tail: "}" TEMPLATE_CHARACTERS? "`"
+         template_substituted: template_head expression ( template_middle expression )* template_tail
+         template_pure: "`" TEMPLATE_CHARACTERS? "`"
+         template_literal: template_pure | template_substituted
          UNARY_OPERATOR: "--" | "++"
          PREFIX_UNARY_OPERATOR: "-" | "!"
          BINARY_OPERATOR: "==" | "!=" | "<=" | ">=" | "||" | "&&" | "//" | "/*" | "<<" | ">>" | ">>>" | "**" | "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "^=" | "|=" | "<<=" | ">>=" | ">>>" | "..." | "+" | "-" | "*" | "/" | "%" | ">" | "<" | "=" | "&" | "|" | "contains"
@@ -369,7 +402,7 @@ l = Lark('''
          singular_enum_expression: "$" ENUMERATED_TYPE "[" enum_name "]"
          plural_enum_expression: "$" ENUMERATED_TYPES "[" ( enum_name ( "," enum_name )* )? "]"
          enum_expression: singular_enum_expression | plural_enum_expression
-         expression: binary_expression | unary_expression | unary_postfix_expression | ternary_expression | enum_expression | method_expression | field_expression | index_expression | paren_expression | function_call | call_expression | new_expression | NUMBER | STRING_LITERAL | BOOLEAN | IDENTIFIER
+         expression: binary_expression | unary_expression | unary_postfix_expression | ternary_expression | enum_expression | method_expression | field_expression | index_expression | paren_expression | function_call | call_expression | new_expression | NUMBER | STRING_LITERAL | template_literal | BOOLEAN | IDENTIFIER
          index_type: PRIMITIVE_TYPE | ENUMERATED_TYPE | /[0-9]+/
          aggregate_type: type "[" index_type ( "," index_type )* "]"
          type: PRIMITIVE_TYPE | ENUMERATED_TYPE | aggregate_type | IDENTIFIER
@@ -411,7 +444,7 @@ for filename in sys.argv[1:]:
     print(transformed)
     # print(comments)
 # tree = l.parse('''
-# int [int, boolean, /* xyz */ string] x;
+# `{b}v`;
 # ''')
 # transformed = Rewriter(visit_tokens=True).transform(tree)
 # print(transformed)
