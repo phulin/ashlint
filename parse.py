@@ -22,7 +22,7 @@ class Chunk(object):
         if isinstance(value, Token):
             if start is None: start = Location(value.line, value.column)
             if end is None: end = Location(value.end_line, value.end_column)
-        elif not isinstance(value, str): assert false
+        elif not isinstance(value, str): assert False
 
         self.value = value
         self.start = start
@@ -57,6 +57,9 @@ class Chunk(object):
 
     def __getitem__(self, index):
         return Chunk(self.value.__getitem__(index), self.start, self.end)
+
+    def __len__(self):
+        return len(self.value)
 
     def join(self, args):
         if len(args) == 0: return Chunk('')
@@ -112,6 +115,9 @@ def smoosh(self, children):
 def spaces(self, children):
     return Chunk(' ').join(children)
 
+def camelcase(s):
+    return re.sub(r'(?!^)_([a-zA-Z])', lambda m: m.group(1).upper(), s)
+
 def formatted(format_string):
     def result(self, children):
         return Chunk(format_string).format(*children)
@@ -122,12 +128,20 @@ class Rewriter(Transformer):
     ENUMERATED_TYPES = literal
     PRIMITIVE_TYPE = literal
     BOOLEAN = literal
-    IDENTIFIER = literal
     NUMBER = literal
     STRING_LITERAL = literal
     UNARY_OPERATOR = literal
     PREFIX_UNARY_OPERATOR = literal
-    BINARY_OPERATOR = literal
+
+    def IDENTIFIER(self, id):
+        prefix = "Lib." if literal(self, id).value in ashref else ""
+        return Chunk(prefix + camelcase(literal(self, id).value))
+
+    def BINARY_OPERATOR(self, op):
+        map = { '==': '===', '!=': '!==' }
+        return Chunk('{}').format(Chunk(op) + Chunk('=') if op in map else op)
+
+    def COMMENT(self, *args): assert False
 
     def STRING_LITERAL(self, value):
         return Chunk('"{}"').format(Chunk(value)[1:-1])
@@ -160,7 +174,11 @@ class Rewriter(Transformer):
     field_expression = formatted('{}.{}')
 
     # method_expression: expression "." function_call
-    method_expression = formatted('{}.{}')
+    def method_expression(self, children):
+        expression, func = children
+        func.value = func.value.replace('(', '(' + expression.value + ', ', 1)
+        func.value = func.value.replace(', )', ')')
+        return func
 
     # call_expression: "call" function_call
     call_expression = formatted('call {}')
@@ -226,7 +244,7 @@ class Rewriter(Transformer):
     # if_statement: "if" "(" expression ")" block_or_statement ( "else" block_or_statement )?
     def if_statement(self, children):
         condition, body, *rest = children
-        return Chunk('if ({}) {}').format(condition, body) + (Chunk(' else {}').format(rest[0]) if len(rest) > 0 else Chunk(''))
+        return Chunk('if ({}) {}').format(condition, body) + (Chunk(' ') if body.value.endswith('}') else Chunk('\n')) + (Chunk('else {}').format(rest[0]) if len(rest) > 0 else Chunk(''))
 
     # while_statement: "while" "(" expression ")" block_or_statement
     while_statement = formatted('while ({}) {}')
@@ -273,13 +291,22 @@ class Rewriter(Transformer):
         return declaration + (Chunk(' = {};').format(rest[0]) if len(rest) > 0 else Chunk(';'))
 
     # variable_declaration: type IDENTIFIER
-    variable_declaration = spaces
+    def variable_declaration(self, children):
+        typ, identifier = children
+        return Chunk('const {}').format(identifier)
+
+    def argument_declaration(self, children):
+        typ, identifier = children
+        if typ.value in ['int', 'float']: result = 'number'
+        elif typ.value in ['boolean', 'string']: result = typ.value
+        else: result = typ.value.capitalize()
+        return Chunk('{}: {}').format(identifier, Chunk(result))
 
     # function_declaration: return_type IDENTIFIER "(" ( variable_declaration ( "," variable_declaration )* )? ")" block
     def function_declaration(self, children):
         ret, name, *arguments = children[:-1]
         body = children[-1]
-        return Chunk('{} {}({}) {}').format(ret, name, Chunk(', ').join(arguments), body)
+        return Chunk('function {}({}) {}').format(name, Chunk(', ').join(arguments), body)
 
     # record_declaration: "record"i IDENTIFIER "{" ( variable_declaration ";" )+ "}" ";"
     @v_args(meta=True)
@@ -309,6 +336,7 @@ class Rewriter(Transformer):
     def file(self, chlidren):
         return Chunk('{}\n').format(Chunk.join_lines(chlidren, indent=False))
 
+comments = []
 l = Lark('''
          COMMENT: "/*" /(.|\\n)*?/ "*/" | "//" /.*/
          %ignore COMMENT
@@ -364,23 +392,27 @@ l = Lark('''
          typedef_statement: "typedef" type IDENTIFIER ";"
          variable_declaration: type IDENTIFIER
          variable_declaration_statement: variable_declaration ( "=" expression | "="? ( dict_literal | array_literal ) )? ";"
-         function_declaration: return_type IDENTIFIER "(" ( variable_declaration ( "," variable_declaration )* )? ")" block
+         argument_declaration: type IDENTIFIER
+         function_declaration: return_type IDENTIFIER "(" ( argument_declaration ( "," argument_declaration )* )? ")" block
          record_declaration: "record"i IDENTIFIER "{" ( variable_declaration ";" )+ "}" ";"
          import_statement: "import" ( STRING_LITERAL | /<.*?(?<!\\\\)>/ )
          statement: if_statement | while_statement | for_statement | foreach_statement | switch_statement | static_statement | return_statement | typedef_statement | remove_statement | sort_statement | CONTINUE_STATEMENT | BREAK_STATEMENT | since_statement | variable_declaration_statement | expression_statement 
          block: "{" ( statement | function_declaration | record_declaration | block )* "}"
          block_or_statement: block | statement
          file: ( statement | function_declaration | record_declaration | import_statement )+
-         ''', start='file', propagate_positions=True)
+         ''', start='file', propagate_positions=True, lexer_callbacks={ 'variable_declaration': print })
+
+ashref = set(open('ashref.txt').read().splitlines())
 
 for filename in sys.argv[1:]:
-    print(filename)
+    # print(filename)
     tree = l.parse(open(filename).read())
-    transformed = Rewriter().transform(tree)
+    transformed = Rewriter(visit_tokens=True).transform(tree)
     print(transformed)
+    # print(comments)
 # tree = l.parse('''
-# int [int, boolean, string] x;
+# int [int, boolean, /* xyz */ string] x;
 # ''')
-# transformed = Rewriter().transform(tree)
+# transformed = Rewriter(visit_tokens=True).transform(tree)
 # print(transformed)
-# print(tree.pretty())
+# print(tree)
