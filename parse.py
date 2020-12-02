@@ -63,16 +63,27 @@ class Chunk(object):
 
     def join(self, args):
         if len(args) == 0: return Chunk('')
-        return Chunk(self.value.join([arg.value for arg in args]), Chunk.start(args[0]), Chunk.end(args[-1]))
+        starts = [Chunk.start(arg) for arg in args if Chunk.start(arg) is not None]
+        ends = [Chunk.end(arg) for arg in args if Chunk.end(arg) is not None]
+        start = starts[0] if len(starts) > 0 else None
+        end = ends[-1] if len(ends) > 0 else None
+        return Chunk(self.value.join([arg.value for arg in args]), start, end)
 
     def format(self, *args):
-        return Chunk(self.value.format(*[arg.value for arg in args]), Chunk.start(args[0]), Chunk.end(args[-1]))
+        starts = [Chunk.start(arg) for arg in args if Chunk.start(arg) is not None]
+        ends = [Chunk.end(arg) for arg in args if Chunk.end(arg) is not None]
+        start = starts[0] if len(starts) > 0 else None
+        end = ends[-1] if len(ends) > 0 else None
+        return Chunk(self.value.format(*[arg.value for arg in args]), start, end)
 
     def replace(self, x, y):
         return Chunk(self.value.replace(x, y), self.start, self.end)
 
     def indent(self):
         return Chunk(indent(self.value), self.start, self.end)
+
+    def camelcase(self):
+        return Chunk(camelcase(self.value), self.start, self.end)
 
     def __repr__(self):
         return 'Chunk({!r}, {!r}, {!r})'.format(self.value, self.start, self.end)
@@ -89,11 +100,21 @@ class Chunk(object):
 
         pieces = []
         for line, next_line in zip(lines, lines[1:]):
-            distance = 1
             if line.end is not None and next_line.start is not None:
-                distance = max(next_line.start.line - line.end.line, 1)
-            pieces.append(line.value)
-            pieces.append('\n' * distance)
+                if line.end.line in all_comments and not all_comments[line.end.line].value in line.value:
+                    pieces.append(line.value + ' ' + all_comments[line.end.line].value)
+                else:
+                    pieces.append(line.value)
+                pieces.append('\n')
+                for line_num in range(line.end.line + 1, next_line.start.line):
+                    if line_num in all_comments:
+                        comment = all_comments[line_num]
+                        pieces.append(comment.value + '\n')
+                    else:
+                        pieces.append('\n')
+            else:
+                pieces.append(line.value)
+                pieces.append('\n')
 
         pieces.append(lines[-1].value)
 
@@ -102,7 +123,7 @@ class Chunk(object):
         if indent: return result.indent()
         else: return result
 
-INDENT = ' ' * 4
+INDENT = ' ' * 2
 def indent(s):
     return re.sub(r'^(?!$)', INDENT, s, flags=re.MULTILINE)
 
@@ -119,6 +140,7 @@ def spaces(self, children):
     return Chunk(' ').join(children)
 
 def camelcase(s):
+    if re.match(r'[A-Z_]+', s): return s
     return re.sub(r'(?!^)_([a-zA-Z])', lambda m: m.group(1).upper(), s)
 
 def formatted(format_string):
@@ -160,12 +182,16 @@ class Rewriter(Transformer):
     template_literal = passthru
 
     def IDENTIFIER(self, id):
-        prefix = "Lib." if literal(self, id).value in ashref else ""
-        return Chunk(prefix + camelcase(literal(self, id).value))
+        return Chunk(id).camelcase()
 
     def BINARY_OPERATOR(self, op):
         map = { '==': '===', '!=': '!==' }
         return Chunk('{}').format(Chunk(op) + Chunk('=') if op in map else op)
+
+    # CONTINUE_STATEMENT: "continue" ";"
+    # BREAK_STATEMENT: "break" ";"
+    CONTINUE_STATEMENT = literal
+    BREAK_STATEMENT = literal
 
     def COMMENT(self, *args): assert False
 
@@ -175,7 +201,12 @@ class Rewriter(Transformer):
     # function_call: IDENTIFIER "(" ( expression ( "," ( expression? ) )* )? ")"
     def function_call(self, children):
         name, *rest = children
-        return Chunk('{}({})').format(name, Chunk(', ').join(rest))
+        if name.value == 'abort' and len(rest) > 0:
+            return Chunk('throw {}').format(rest[0])
+        if len(rest) > 0:
+            return Chunk('{}({})').format(name, Chunk(', ').join(rest))
+        else:
+            return Chunk('{}()').format(name)
 
     # index_expression: expression "[" expression "]"
     def index_expression(self, children):
@@ -188,7 +219,10 @@ class Rewriter(Transformer):
     unary_postfix_expression = smoosh
 
     # binary_expression: expression BINARY_OPERATOR expression
-    binary_expression = spaces
+    def binary_expression(self, children):
+        if children[1].value == 'contains':
+            return Chunk('{}.includes({})').format(children[0], children[1])
+        return spaces(self, children)
 
     # ternary_expression: expression "?" expression ":" expression
     ternary_expression = formatted('{} ? {} : {}')
@@ -202,6 +236,8 @@ class Rewriter(Transformer):
     # method_expression: expression "." function_call
     def method_expression(self, children):
         expression, func = children
+        if func.value == 'count()':
+            return Chunk('{}.length').format(expression)
         func.value = func.value.replace('(', '(' + expression.value + ', ', 1)
         func.value = func.value.replace(', )', ')')
         return func
@@ -216,11 +252,12 @@ class Rewriter(Transformer):
     enum_name = passthru
 
     # singular_enum_expression: "$" ENUMERATED_TYPE "[" enum_name "]"
-    singular_enum_expression = formatted('${}`{}`')
+    def singular_enum_expression(self, children):
+        result = formatted('${}`{}`')(self, children)
+        return result
 
     # plural_enum_expression: "$" ENUMERATED_TYPES "[" ( enum_name ( "," enum_name )* )? "]"
     def plural_enum_expression(self, children):
-        print(children)
         typ, *rest = children
         return Chunk('${}`{}`').format(typ, Chunk(', ').join(rest))
 
@@ -253,7 +290,8 @@ class Rewriter(Transformer):
         return Chunk('{{{}}}').format(Chunk(', ').join(children))
 
     # array_literal: "{" ( expression ( "," expression )* )? ","? "}"
-    array_literal = dict_literal
+    def array_literal(self, children):
+        return Chunk('[{}]').format(Chunk(', ').join(children))
 
     # remove_statement: "remove" index_expression ";"
     remove_statement = formatted('remove {};')
@@ -270,7 +308,16 @@ class Rewriter(Transformer):
     # if_statement: "if" "(" expression ")" block_or_statement ( "else" block_or_statement )?
     def if_statement(self, children):
         condition, body, *rest = children
-        return Chunk('if ({}) {}').format(condition, body) + (Chunk(' ') if body.value.endswith('}') else Chunk('\n')) + (Chunk('else {}').format(rest[0]) if len(rest) > 0 else Chunk(''))
+        if body.value.endswith('}'):
+            if len(rest) > 0:
+                return Chunk('if ({}) {} else {}').format(condition, body, rest[0])
+            else:
+                return Chunk('if ({}) {}').format(condition, body)
+        else:
+            if len(rest) > 0:
+                return Chunk('if ({}) {}\nelse {}').format(condition, body, rest[0])
+            else:
+                return Chunk('if ({}) {}').format(condition, body)
 
     # while_statement: "while" "(" expression ")" block_or_statement
     while_statement = formatted('while ({}) {}')
@@ -288,7 +335,7 @@ class Rewriter(Transformer):
     def foreach_statement(self, children):
         names = children[:-2]
         aggregate, body = children[-2:]
-        return Chunk('for (const {} of {}) {}').format(literal(self, names[0]), aggregate, body)
+        return Chunk('for (const {} of {}) {}').format(names[-1], aggregate, body)
 
     # case: ( "case" expression | "default" ) ":" ( block_or_statement )*
     def case(self, children):
@@ -319,7 +366,8 @@ class Rewriter(Transformer):
     # variable_declaration: type IDENTIFIER
     def variable_declaration(self, children):
         typ, identifier = children
-        return Chunk('const {}').format(identifier)
+        result = Chunk('const {}').format(identifier)
+        return result
 
     def argument_declaration(self, children):
         typ, identifier = children
@@ -329,16 +377,18 @@ class Rewriter(Transformer):
         return Chunk('{}: {}').format(identifier, Chunk(result))
 
     # function_declaration: return_type IDENTIFIER "(" ( variable_declaration ( "," variable_declaration )* )? ")" block
-    def function_declaration(self, children):
+    @v_args(meta=True)
+    def function_declaration(self, children, meta):
         ret, name, *arguments = children[:-1]
         body = children[-1]
-        return Chunk('function {}({}) {}').format(name, Chunk(', ').join(arguments), body)
+        return Chunk('function {}({}) {}').format(name, Chunk(', ').join(arguments), body).with_meta(meta)
 
     # record_declaration: "record"i IDENTIFIER "{" ( variable_declaration ";" )+ "}" ";"
     @v_args(meta=True)
     def record_declaration(self, children, meta):
         name, *rest = children
-        return Chunk('') # Chunk('record {} {{\n{}\n}}').format(name, Chunk.join_lines(rest)).with_meta(meta)
+        simulated = Chunk('record {} {{\n{}\n}}').format(name, Chunk.join_lines(rest)).with_meta(meta)
+        return Chunk('', simulated.start, simulated.end) # Chunk('record {} {{\n{}\n}}').format(name, Chunk.join_lines(rest)).with_meta(meta)
 
     # import_statement: "import" ( STRING_LITERAL | /<.*?(?<!\\\\)>/ )
     def import_statement(self, children):
@@ -364,7 +414,7 @@ class Rewriter(Transformer):
 
 comments = []
 l = Lark('''
-         COMMENT: "/*" /(.|\\n)*?/ "*/" | "//" /.*/
+         COMMENT: "/*" /(.|\\n)*?/ "*/" | "//" /.*/ | "#" /.*/
          %ignore COMMENT
          %import common.WS
          %ignore WS
@@ -398,7 +448,7 @@ l = Lark('''
          method_expression: expression "." function_call
          call_expression: "call" function_call
          new_expression: "new" function_call
-         enum_name: /(\\[[0-9]+\\])?[a-zA-Z0-9-&; '"?,\\\\()\\.*:!\\/í_]+/
+         enum_name: /(\\[[0-9]+\\])?[a-zA-Z0-9-&; '"?,#%\\\\()\\.*:!\\/í_]+/
          singular_enum_expression: "$" ENUMERATED_TYPE "[" enum_name "]"
          plural_enum_expression: "$" ENUMERATED_TYPES "[" ( enum_name ( "," enum_name )* )? "]"
          enum_expression: singular_enum_expression | plural_enum_expression
@@ -433,16 +483,21 @@ l = Lark('''
          block: "{" ( statement | function_declaration | record_declaration | block )* "}"
          block_or_statement: block | statement
          file: ( statement | function_declaration | record_declaration | import_statement )+
-         ''', start='file', propagate_positions=True, lexer_callbacks={ 'variable_declaration': print })
+         ''', start='file', propagate_positions=True)
 
 ashref = set(open('ashref.txt').read().splitlines())
 
 for filename in sys.argv[1:]:
     # print(filename)
-    tree = l.parse(open(filename).read())
+    text = open(filename).read()
+    all_comments = {}
+    for match in re.finditer(r'//.*', text):
+        start = Location(text[:match.start()].count('\n') + 1, match.start() - text[:match.start()].rfind('\n'))
+        end = Location(text[:match.end()].count('\n') + 1, match.end() - text[:match.end()].rfind('\n'))
+        all_comments[start.line] = (Chunk(match[0], start, end))
+    tree = l.parse(text)
     transformed = Rewriter(visit_tokens=True).transform(tree)
     print(transformed)
-    # print(comments)
 # tree = l.parse('''
 # `{b}v`;
 # ''')
