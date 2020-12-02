@@ -221,7 +221,7 @@ class Rewriter(Transformer):
     # binary_expression: expression BINARY_OPERATOR expression
     def binary_expression(self, children):
         if children[1].value == 'contains':
-            return Chunk('{}.includes({})').format(children[0], children[1])
+            return Chunk('{}.includes({})').format(children[0], children[2])
         return spaces(self, children)
 
     # ternary_expression: expression "?" expression ":" expression
